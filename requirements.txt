@@ -1,22 +1,42 @@
 #albumentations==0.5.2
 #filesplit==3.0.2
+# Note: this project uses the (broken on PyPI) `fsplit` package. A minimal
+# shim is bundled under site-packages/fsplit/ to provide the Filesplit class
+# used by backend/config.py to merge the split model files.
 opencv-python==4.8.1.78
-scikit-image==0.17.2
+scikit-image
 imgaug==0.4.0
 kornia==0.5.0
-pyclipper==1.3.0.post5
-lmdb==1.4.1
+pyclipper
+lmdb
 PyYAML==6.0.1
 omegaconf==2.1.2
-tqdm==4.66.1
-#PySimpleGUI==4.55.1
-PySimpleGUI
-easydict==1.9
-scikit-learn==0.24.2
-pandas==2.0.3
-webdataset==0.2.57
-pytorch-lightning==1.2.9
-numpy==1.23.1
+tqdm
+# PySimpleGUI 4.60.5.x is the last MIT-licensed release (5.x+ is commercial).
+PySimpleGUI==4.60.5.1
+easydict
+scikit-learn
+pandas
+webdataset
+pytorch-lightning
+numpy<2
 protobuf==3.20.0
-av==11.0.0
-einops==0.7.0
+av
+einops
+# PaddlePaddle (use the post120 wheel for CUDA 12.x, post117 for 11.7, etc.)
+# paddlepaddle-gpu==2.6.1.post120
+# OCR (old-style paddleocr 2.x API is what backend/tools/infer/* expects)
+# paddleocr>=2.6,<3
+# Misc helpers the codebase imports directly
+shapely
+scenedetect
+torchvision
+cython
+
+# PaddlePaddle inference engine expects cuDNN 8 to be loadable on Windows.
+# 9.x wheels are NOT binary-compatible with paddle 2.6.x — must pin 8.9.x.
+# The cudnn/cublas/cuda_nvrtc bin folders are auto-added to PATH in gui.py
+# so no manual DLL setup is required.
+nvidia-cudnn-cu12==8.9.7.29
+nvidia-cublas-cu12==12.3.4.1
+nvidia-cuda-nvrtc-cu12==12.3.103

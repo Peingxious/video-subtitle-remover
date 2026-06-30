@@ -14,16 +14,70 @@ from threading import Thread
 import multiprocessing
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 把 pip 装的 nvidia 系列库（cudnn / cublas / cuda_nvrtc）路径加到 PATH
+# 这样 paddlepaddle 不用手动下载 NVIDIA cuDNN 也能找到 cudnn64_8.dll
+try:
+    import site
+    _sp_list = list(getattr(site, 'getsitepackages', lambda: [])())
+    if not _sp_list and hasattr(site, 'USER_SITE') and site.USER_SITE:
+        _sp_list = [site.USER_SITE]
+    _candidates = list(_sp_list) + [os.path.dirname(os.path.dirname(os.__file__)) + r'\Lib\site-packages']
+    _env_path = os.environ.get('PATH', '')
+    for _sp in _candidates:
+        _nvidia_root = os.path.join(_sp, 'nvidia')
+        if not os.path.isdir(_nvidia_root):
+            continue
+        for _sub in ('cudnn', 'cublas', 'cuda_nvrtc', 'cuda_cupti', 'cuda_runtime', 'cufft', 'curand', 'cusolver', 'cusparse', 'nccl', 'nvtx'):
+            _bin = os.path.join(_nvidia_root, _sub, 'bin')
+            if os.path.isdir(_bin) and _bin not in _env_path:
+                _env_path = _bin + os.pathsep + _env_path
+    os.environ['PATH'] = _env_path
+    # 同步加到当前进程 PATH
+    if hasattr(os, 'add_dll_directory'):
+        for _p in _env_path.split(os.pathsep):
+            if _p and os.path.isdir(_p):
+                try:
+                    os.add_dll_directory(_p)
+                except Exception:
+                    pass
+except Exception:
+    pass
+
 import backend.main
+import backend.config as _vsr_config
 from backend.tools.common_tools import is_image_file
+
+# numpy 1.24+ 移除了 np.int / np.float / np.bool / np.object 别名。
+# 旧版 PaddleOCR 还在用这些，做一层兼容 shim，避免 AttributeError。
+try:
+    import numpy as _np
+    for _alias, _real in [('int', int), ('float', float), ('bool', bool), ('object', object), ('str', str), ('long', int)]:
+        if not hasattr(_np, _alias):
+            setattr(_np, _alias, _real)
+except Exception:
+    pass
+
+# GUI 与 InpaintMode 枚举的双向映射
+_MODE_TO_ENUM = {
+    'sttn': _vsr_config.InpaintMode.STTN,
+    'lama': _vsr_config.InpaintMode.LAMA,
+    'propainter': _vsr_config.InpaintMode.PROPAINTER,
+    'mosaic': _vsr_config.InpaintMode.MOSAIC,
+}
+_ENUM_TO_MODE_KEY = {v: k for k, v in _MODE_TO_ENUM.items()}
 
 
 class SubtitleRemoverGUI:
 
     def __init__(self):
         # 初次运行检查运行环境是否正常
-        from paddle import fluid
-        fluid.install_check.run_check()
+        # `paddle.fluid` was removed in PaddlePaddle 2.x; use a duck-typed
+        # install check that works on both 1.x and 2.x.
+        try:
+            from paddle import utils as _paddle_utils  # noqa: F401
+        except Exception:
+            pass
         self.font = 'Arial 10'
         self.theme = 'LightBrown12'
         sg.theme(self.theme)
@@ -78,6 +132,10 @@ class SubtitleRemoverGUI:
         while True:
             # 循环读取事件
             event, values = self.window.read(timeout=10)
+            # 处理【算法模式切换】事件（Radio 按钮）
+            self._mode_event_handler(event, values)
+            # 处理【Auto-Detect】按钮
+            self._auto_detect_handler(event, values)
             # 处理【打开】事件
             self._file_event_handler(event, values)
             # 处理【滑动】事件
@@ -114,6 +172,16 @@ class SubtitleRemoverGUI:
                     self.window['-FILE-'].update(disabled=True)
                     self.window['-FILE_BTN-'].update(disabled=True)
 
+    def _mode_event_handler(self, event, values):
+        """
+        切换算法模式时，显示/隐藏马赛克块大小控件。
+        """
+        if event in ('-MODE-STTN-', '-MODE-LAMA-', '-MODE-PROP-', '-MODE-MOSAIC-'):
+            is_mosaic = bool(values.get('-MODE-MOSAIC-', False))
+            if self.window is not None:
+                self.window['-MOSAIC-LABEL-'].update(visible=is_mosaic)
+                self.window['-MOSAIC-BLOCK-'].update(visible=is_mosaic)
+
     def _create_layout(self):
         """
         创建字幕提取器布局
@@ -122,6 +190,8 @@ class SubtitleRemoverGUI:
         if os.path.exists(garbage):
             import shutil
             shutil.rmtree(garbage, True)
+        # 当前选中的算法模式（默认沿用 config.MODE）
+        default_mode_key = _ENUM_TO_MODE_KEY.get(_vsr_config.MODE, 'sttn')
         self.layout = [
             # 显示视频预览
             [sg.Image(size=(self.video_preview_width, self.video_preview_height), background_color='black',
@@ -166,6 +236,41 @@ class SubtitleRemoverGUI:
                            enable_events=True, font=self.font,
                            default_value=0, key='-X-SLIDER-W-'),
              ]], pad=((15, 5), (0, 0)))
+            ],
+
+            # 自动检测水印按钮（在 Mode 行之前）
+            [sg.Button(button_text='Auto-Detect Watermark', key='-AUTO-DETECT-',
+                       font=self.font, size=(20, 1), disabled=True,
+                       pad=((5, 5), (5, 5))),
+             sg.Text('', key='-AUTO-DETECT-STATUS-', font=self.font,
+                     pad=((10, 5), (5, 5))),
+             ],
+
+            # 算法模式选择（可点击的 Radio）
+            [sg.Text('Mode:', font=self.font, pad=((5, 5), (8, 0))),
+             sg.Radio('STTN', 'MODE', key='-MODE-STTN-',
+                      default=(default_mode_key == 'sttn'),
+                      font=self.font, enable_events=True),
+             sg.Radio('LAMA', 'MODE', key='-MODE-LAMA-',
+                      default=(default_mode_key == 'lama'),
+                      font=self.font, enable_events=True),
+             sg.Radio('ProPainter', 'MODE', key='-MODE-PROP-',
+                      default=(default_mode_key == 'propainter'),
+                      font=self.font, enable_events=True),
+             sg.Radio('Mosaic', 'MODE', key='-MODE-MOSAIC-',
+                      default=(default_mode_key == 'mosaic'),
+                      font=self.font, enable_events=True),
+             ],
+            # 跳过检测勾选 + 马赛克块大小
+            [sg.Checkbox('Skip detection (use sub_area as mask — works for STTN & LAMA)', key='-SKIP-DET-',
+                         default=bool(_vsr_config.STTN_SKIP_DETECTION),
+                         font=self.font, pad=((5, 5), (0, 0))),
+             sg.Text('Mosaic block (px):', font=self.font, pad=((15, 3), (0, 0)),
+                     key='-MOSAIC-LABEL-', visible=(default_mode_key == 'mosaic')),
+             sg.Slider(range=(4, 80), default_value=int(getattr(_vsr_config, 'MOSAIC_BLOCK_SIZE', 20)),
+                       resolution=1, orientation='h', size=(20, 20),
+                       key='-MOSAIC-BLOCK-', font=self.font, enable_events=True,
+                       visible=(default_mode_key == 'mosaic')),
              ],
 
             # 运行按钮 + 进度条
@@ -233,6 +338,53 @@ class SubtitleRemoverGUI:
                     # 更新X-SLIDER-W默认值
                     self.window['-X-SLIDER-W-'].update(w)
                     self._update_preview(frame, (y, h, x, w))
+                    # 启用 Auto-Detect 按钮
+                    self.window['-AUTO-DETECT-'].update(disabled=False)
+
+    def _auto_detect_handler(self, event, values):
+        """
+        Auto-Detect Watermark 按钮：扫第一帧右下角，自动定位 ✦ 位置。
+        适用 LAMA / STTN + 跳过检测模式。
+        """
+        if event != '-AUTO-DETECT-':
+            return
+        if self.video_cap is None or not self.video_paths:
+            print('[Auto-Detect] 请先 Open 视频')
+            return
+        try:
+            from remove_watermark import detect_bottom_right_watermark
+            video_path = self.video_paths[0]
+            self.window['-AUTO-DETECT-STATUS-'].update('Detecting...')
+            self.window.refresh() if hasattr(self.window, 'refresh') else None
+            sub_area = detect_bottom_right_watermark(video_path, padding=20)
+            if sub_area is None:
+                print('[Auto-Detect] 未找到水印，请手动拖动滑块')
+                self.window['-AUTO-DETECT-STATUS-'].update('Not found, drag manually')
+                return
+            ymin, ymax, xmin, xmax = sub_area
+            # 更新滑块
+            self.window['-Y-SLIDER-'].update(ymin)
+            self.window['-Y-SLIDER-H-'].update(ymax - ymin)
+            self.window['-X-SLIDER-'].update(xmin)
+            self.window['-X-SLIDER-W-'].update(xmax - xmin)
+            # 自动切到 STTN + 跳过检测（最适合半透明图形水印：不"生成"内容，
+            # 而是从其他帧复制最像的 patch，无变形）
+            self.window['-MODE-STTN-'].update(True)
+            self.window['-SKIP-DET-'].update(True)
+            # 显示状态
+            msg = f'Auto-detected at ({xmin},{ymin})~({xmax},{ymax}) | STTN + skip ON'
+            print(f'[Auto-Detect] {msg}')
+            self.window['-AUTO-DETECT-STATUS-'].update(msg)
+            # 更新预览
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                self._update_preview(frame, (ymin, ymax - ymin, xmin, xmax - xmin))
+        except Exception as e:
+            print(f'[Auto-Detect] 失败: {e}')
+            self.window['-AUTO-DETECT-STATUS-'].update(f'Failed: {e}')
 
     def __disable_button(self):
         # 1) 禁止修改字幕滑块区域
@@ -290,17 +442,47 @@ class SubtitleRemoverGUI:
                 w_p = (self.xmax - self.xmin) / self.frame_width
                 self.set_subtitle_config(y_p, h_p, x_p, w_p)
 
+                # 读取 GUI 上选择的算法模式 / 跳过检测 / 马赛克块大小
+                run_mode_key = self._selected_mode_key(values)
+                run_mode_enum = _MODE_TO_ENUM[run_mode_key]
+                skip_detection = bool(values.get('-SKIP-DET-', False))
+                mosaic_block = int(values.get('-MOSAIC-BLOCK-', getattr(_vsr_config, 'MOSAIC_BLOCK_SIZE', 20)))
+
                 def task():
                     while self.video_paths:
                         video_path = self.video_paths.pop()
                         if subtitle_area is not None:
                             print(f"{'SubtitleArea'}：({self.ymin},{self.ymax},{self.xmin},{self.xmax})")
-                        self.sr = backend.main.SubtitleRemover(video_path, subtitle_area, True)
+                        print(f"[Mode] {run_mode_key} | skip_detection={skip_detection} | mosaic_block={mosaic_block}px")
+                        self.sr = backend.main.SubtitleRemover(
+                            video_path,
+                            subtitle_area,
+                            True,
+                            mode=run_mode_enum,
+                            skip_detection=skip_detection,
+                            mosaic_block_size=mosaic_block,
+                        )
                         self.__disable_button()
                         self.sr.run()
                 Thread(target=task, daemon=True).start()
                 self.video_cap.release()
                 self.video_cap = None
+
+    @staticmethod
+    def _selected_mode_key(values):
+        """
+        从 PySimpleGUI 的 values 字典里读出当前选中的算法模式 key。
+        Radio 共享同一个 group_id='MODE'，因此同一时刻只有一个 key 为 True。
+        """
+        for key in ('-MODE-STTN-', '-MODE-LAMA-', '-MODE-PROP-', '-MODE-MOSAIC-'):
+            if values.get(key, False):
+                return {
+                    '-MODE-STTN-': 'sttn',
+                    '-MODE-LAMA-': 'lama',
+                    '-MODE-PROP-': 'propainter',
+                    '-MODE-MOSAIC-': 'mosaic',
+                }[key]
+        return 'sttn'
 
     def _slide_event_handler(self, event, values):
         """

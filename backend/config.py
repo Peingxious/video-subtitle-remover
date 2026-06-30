@@ -61,6 +61,7 @@ class InpaintMode(Enum):
     STTN = 'sttn'
     LAMA = 'lama'
     PROPAINTER = 'propainter'
+    MOSAIC = 'mosaic'
 
 
 # ×××××××××××××××××××× [可以改] start ××××××××××××××××××××
@@ -109,12 +110,12 @@ PIXEL_TOLERANCE_X = 20  # 允许检测框横向偏差的像素点数
 注意：要保证STTN_MAX_LOAD_NUM大于STTN_NEIGHBOR_STRIDE和STTN_REFERENCE_LENGTH
 """
 STTN_SKIP_DETECTION = True
-# 参考帧步长
-STTN_NEIGHBOR_STRIDE = 5
-# 参考帧长度（数量）
-STTN_REFERENCE_LENGTH = 10
+# 参考帧步长（默认 5）。水印场景建议 2-3：扫描更密集，更容易找到"无水印 / 水印偏移"的那一帧
+STTN_NEIGHBOR_STRIDE = 2
+# 参考帧长度（默认 10）。水印场景建议 25-40：让模型在更大时间窗口里挑最像的 patch
+STTN_REFERENCE_LENGTH = 30
 # 设置STTN算法最大同时处理的帧数量
-STTN_MAX_LOAD_NUM = 50
+STTN_MAX_LOAD_NUM = 80
 if STTN_MAX_LOAD_NUM < STTN_REFERENCE_LENGTH * STTN_NEIGHBOR_STRIDE:
     STTN_MAX_LOAD_NUM = STTN_REFERENCE_LENGTH * STTN_NEIGHBOR_STRIDE
 # ×××××××××× InpaintMode.STTN算法设置 end ××××××××××
@@ -130,4 +131,11 @@ PROPAINTER_MAX_LOAD_NUM = 70
 # 是否开启极速模式，开启后不保证inpaint效果，仅仅对包含文本的区域文本进行去除
 LAMA_SUPER_FAST = False
 # ×××××××××× InpaintMode.LAMA算法设置 end ××××××××××
+
+# ×××××××××× InpaintMode.MOSAIC算法设置 start ××××××××××
+# 马赛克模式：对用户框选区域做马赛克（像素化）处理。
+# 适合去除固定位置的图形水印（AI 视频工具右下角的 ✦、台标等）。
+# 不需要加载任何模型，速度极快。
+MOSAIC_BLOCK_SIZE = 20  # 马赛克块大小（像素），值越大马赛克越粗
+# ×××××××××× InpaintMode.MOSAIC算法设置 end ××××××××××
 # ×××××××××××××××××××× [可以改] end ××××××××××××××××××××

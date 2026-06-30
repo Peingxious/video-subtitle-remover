@@ -509,7 +509,7 @@ class SubtitleDetect:
 
 
 class SubtitleRemover:
-    def __init__(self, vd_path, sub_area=None, gui_mode=False):
+    def __init__(self, vd_path, sub_area=None, gui_mode=False, mode=None, skip_detection=None, mosaic_block_size=None):
         importlib.reload(config)
         # 线程锁
         self.lock = threading.RLock()
@@ -517,6 +517,12 @@ class SubtitleRemover:
         self.sub_area = sub_area
         # 是否为gui运行，gui运行需要显示预览
         self.gui_mode = gui_mode
+        # GUI 传入的运行参数覆盖；None 表示沿用 config.py 中的设置
+        # 注意：存储字符串值，避免 importlib.reload(config) 重建 enum 实例后
+        #       GUI 传进来的 enum 引用与新 config.InpaintMode 不再是同一对象
+        self.mode_override = mode.value if mode is not None and hasattr(mode, 'value') else mode
+        self.skip_detection_override = skip_detection  # bool 或 None
+        self.mosaic_block_size = mosaic_block_size  # int 或 None
         # 判断是否为图片
         self.is_picture = False
         if is_image_file(str(vd_path)):
@@ -536,8 +542,12 @@ class SubtitleRemover:
         self.mask_size = (int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
         self.frame_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.frame_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        # 创建字幕检测对象
-        self.sub_detector = SubtitleDetect(self.video_path, self.sub_area)
+        # 创建字幕检测对象（马赛克模式不需要）
+        run_mode = self._resolve_mode()
+        if run_mode != config.InpaintMode.MOSAIC:
+            self.sub_detector = SubtitleDetect(self.video_path, self.sub_area)
+        else:
+            self.sub_detector = None
         # 创建视频临时对象，windows下delete=True会有permission denied的报错
         self.video_temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
         # 创建视频写对象
@@ -561,6 +571,15 @@ class SubtitleRemover:
         self.preview_frame = None
         # 是否将原音频嵌入到去除字幕后的视频
         self.is_successful_merged = False
+
+    def _resolve_mode(self):
+        """根据 GUI 覆盖值解析本次运行的实际模式（处理 reload 后的 enum 身份问题）"""
+        if self.mode_override is not None:
+            try:
+                return config.InpaintMode(self.mode_override)
+            except (ValueError, KeyError):
+                return config.MODE
+        return config.MODE
 
     @staticmethod
     def get_coordinates(dt_box):
@@ -712,8 +731,9 @@ class SubtitleRemover:
         sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
 
     def sttn_mode(self, tbar):
-        # 是否跳过字幕帧寻找
-        if config.STTN_SKIP_DETECTION:
+        # 是否跳过字幕帧寻找（优先使用 GUI 传入的覆盖值）
+        skip = self.skip_detection_override if self.skip_detection_override is not None else config.STTN_SKIP_DETECTION
+        if skip:
             # 若跳过则世界使用sttn模式
             self.sttn_mode_with_no_detection(tbar)
         else:
@@ -787,7 +807,19 @@ class SubtitleRemover:
 
     def lama_mode(self, tbar):
         print('use lama mode')
-        sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
+        # 是否跳过字幕检测（GUI 覆盖 > config）
+        # 跳过模式：直接把 sub_area 作为 mask，对全帧 inpaint
+        # 用于去除固定位置的图形水印（AI 视频工具的 ✦、台标等，OCR 检测不到）
+        skip = self.skip_detection_override if self.skip_detection_override is not None else False
+        if skip and self.sub_area is not None:
+            ymin, ymax, xmin, xmax = self.sub_area
+            # create_mask 期望的格式：coords = (xmin, xmax, ymin, ymax) — 单帧一个矩形
+            # 这里对全帧生成同样矩形
+            single_box = (xmin, xmax, ymin, ymax)
+            sub_list = {i: [single_box] for i in range(1, int(self.frame_count) + 1)}
+            print(f'[LAMA] skip detection ON, use sub_area={self.sub_area} as mask for all {int(self.frame_count)} frames')
+        else:
+            sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
         if self.lama_inpaint is None:
             self.lama_inpaint = LamaInpaint()
         index = 0
@@ -814,14 +846,83 @@ class SubtitleRemover:
             self.progress_remover = 100 * float(index) / float(self.frame_count) // 2
             self.progress_total = 50 + self.progress_remover
 
+    def mosaic_mode(self, tbar):
+        """
+        马赛克模式：对用户框选区域做像素化处理。
+        适合去除固定位置的图形水印（AI 视频工具右下角的 ✦、台标等）。
+        不需要加载任何模型，速度极快。
+        """
+        print('use mosaic mode')
+        if self.sub_area is not None:
+            ymin, ymax, xmin, xmax = self.sub_area
+        else:
+            print('[Info] No area has been set. Will process the whole frame.')
+            ymin, ymax, xmin, xmax = 0, self.frame_height, 0, self.frame_width
+        block = self.mosaic_block_size if self.mosaic_block_size else int(getattr(config, 'MOSAIC_BLOCK_SIZE', 20))
+        block = max(1, int(block))
+        # 防御：把坐标夹到画面内
+        ymin = max(0, min(int(ymin), self.frame_height))
+        ymax = max(0, min(int(ymax), self.frame_height))
+        xmin = max(0, min(int(xmin), self.frame_width))
+        xmax = max(0, min(int(xmax), self.frame_width))
+        if ymax <= ymin or xmax <= xmin:
+            print(f'[Warning] invalid mosaic area: {(ymin, ymax, xmin, xmax)} — skipping mosaic, copying frames as-is.')
+            index = 0
+            while True:
+                ret, frame = self.video_cap.read()
+                if not ret:
+                    break
+                original_frame = frame
+                index += 1
+                if self.gui_mode:
+                    self.preview_frame = cv2.hconcat([original_frame, frame])
+                if self.is_picture:
+                    cv2.imencode(self.ext, frame)[1].tofile(self.video_out_name)
+                else:
+                    self.video_writer.write(frame)
+                tbar.update(1)
+                self.progress_remover = 100 * float(index) / float(self.frame_count) // 2
+                self.progress_total = 50 + self.progress_remover
+            return
+
+        print(f'[Processing] start mosaicking area (y={ymin}:{ymax}, x={xmin}:{xmax}) with block={block}px...')
+        index = 0
+        while True:
+            ret, frame = self.video_cap.read()
+            if not ret:
+                break
+            original_frame = frame
+            index += 1
+            roi = frame[ymin:ymax, xmin:xmax]
+            if roi.size > 0:
+                h, w = roi.shape[:2]
+                small_w = max(1, w // block)
+                small_h = max(1, h // block)
+                # 先缩小（每个马赛克块取平均色），再以最近邻放大回原尺寸 → 像素化
+                small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+                frame[ymin:ymax, xmin:xmax] = mosaic
+            if self.gui_mode:
+                self.preview_frame = cv2.hconcat([original_frame, frame])
+            if self.is_picture:
+                cv2.imencode(self.ext, frame)[1].tofile(self.video_out_name)
+            else:
+                self.video_writer.write(frame)
+            tbar.update(1)
+            self.progress_remover = 100 * float(index) / float(self.frame_count) // 2
+            self.progress_total = 50 + self.progress_remover
+
     def run(self):
         # 记录开始时间
         start_time = time.time()
+        # 决定本次运行使用的算法模式（GUI 覆盖 > config.MODE）
+        run_mode = self._resolve_mode()
         # 重置进度条
         self.progress_total = 0
         tbar = tqdm(total=int(self.frame_count), unit='frame', position=0, file=sys.__stdout__,
                     desc='Subtitle Removing')
         if self.is_picture:
+            # 图片模式目前只走 LAMA 路径
             sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
             self.lama_inpaint = LamaInpaint()
             original_frame = cv2.imread(self.video_path)
@@ -837,10 +938,12 @@ class SubtitleRemover:
             self.progress_total = 100
         else:
             # 精准模式下，获取场景分割的帧号，进一步切割
-            if config.MODE == config.InpaintMode.PROPAINTER:
+            if run_mode == config.InpaintMode.PROPAINTER:
                 self.propainter_mode(tbar)
-            elif config.MODE == config.InpaintMode.STTN:
+            elif run_mode == config.InpaintMode.STTN:
                 self.sttn_mode(tbar)
+            elif run_mode == config.InpaintMode.MOSAIC:
+                self.mosaic_mode(tbar)
             else:
                 self.lama_mode(tbar)
         self.video_cap.release()
